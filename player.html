@@ -145,6 +145,8 @@
         let aesKey = null;
         let mediaSource = null;
         let sourceBuffer = null;
+        let loadedSegments = new Set(); // Track which segments are loaded
+        let isLoadingSegments = false; // Prevent concurrent loading
 
         function log(level, message) {
             const entry = document.createElement('div');
@@ -376,6 +378,89 @@
             }
         });
 
+        // Calculate which segment index corresponds to a given time
+        function getSegmentIndexForTime(time) {
+            let accumulatedTime = 0;
+            for (let i = 0; i < manifest.segments.length; i++) {
+                const segmentDuration = manifest.segments[i].duration;
+                if (time >= accumulatedTime && time < accumulatedTime + segmentDuration) {
+                    return i;
+                }
+                accumulatedTime += segmentDuration;
+            }
+            return manifest.segments.length - 1; // Last segment
+        }
+
+        // Load a range of segments
+        async function loadSegmentRange(startIdx, endIdx) {
+            if (isLoadingSegments) return;
+            isLoadingSegments = true;
+
+            try {
+                const totalToLoad = endIdx - startIdx;
+                let loaded = 0;
+
+                for (let i = startIdx; i < endIdx; i++) {
+                    // Skip already loaded segments
+                    if (loadedSegments.has(i)) {
+                        loaded++;
+                        continue;
+                    }
+
+                    const segment = manifest.segments[i];
+                    const encrypted = await fetchRange(manifest.blob_file, segment.offset, segment.size);
+                    const decrypted = await decryptSegment(encrypted, aesKey);
+                    await appendToSourceBuffer(decrypted);
+
+                    loadedSegments.add(i);
+                    loaded++;
+
+                    if (i % 5 === 0 || i === endIdx - 1) {
+                        const percent = 65 + (loadedSegments.size / manifest.segments.length) * 35;
+                        updateProgress(percent, `Buffered ${loadedSegments.size}/${manifest.segments.length}`);
+                        log('info', `📥 Buffered segment ${i} (${loadedSegments.size}/${manifest.segments.length} total)`);
+                    }
+                }
+
+                // End stream only when ALL segments are loaded
+                if (loadedSegments.size === manifest.segments.length && mediaSource.readyState === 'open') {
+                    mediaSource.endOfStream();
+                    log('success', '✓ All segments loaded - stream complete!');
+                    updateProgress(100, 'Complete!');
+                }
+            } finally {
+                isLoadingSegments = false;
+            }
+        }
+
+        // Check if we need to load more segments based on current playback position
+        async function checkBuffer() {
+            if (!video || !manifest || video.paused) return;
+
+            const currentTime = video.currentTime;
+            const currentSegmentIdx = getSegmentIndexForTime(currentTime);
+            const bufferAheadSegments = 30; // Keep ~30 seconds ahead
+
+            // Find last loaded segment in sequence
+            let lastLoadedIdx = currentSegmentIdx;
+            while (lastLoadedIdx < manifest.segments.length && loadedSegments.has(lastLoadedIdx)) {
+                lastLoadedIdx++;
+            }
+
+            // Calculate buffer time remaining
+            let bufferTime = 0;
+            for (let i = currentSegmentIdx; i < lastLoadedIdx; i++) {
+                bufferTime += manifest.segments[i].duration;
+            }
+
+            // If buffer is low, load more
+            if (bufferTime < 10 && lastLoadedIdx < manifest.segments.length) {
+                const endIdx = Math.min(lastLoadedIdx + bufferAheadSegments, manifest.segments.length);
+                log('info', `⚡ Buffer low (${bufferTime.toFixed(1)}s), loading segments ${lastLoadedIdx}-${endIdx}`);
+                await loadSegmentRange(lastLoadedIdx, endIdx);
+            }
+        }
+
         async function loadAndPlayVideo() {
             try {
                 // Check codec support
@@ -408,6 +493,10 @@
                 sourceBuffer = mediaSource.addSourceBuffer(codecString);
                 log('success', '✓ SourceBuffer created');
 
+                // Set full duration so browser shows complete timeline
+                mediaSource.duration = manifest.total_duration;
+                log('success', `✓ Set video duration: ${manifest.total_duration.toFixed(1)}s`);
+
                 // Load and decrypt init segment
                 log('info', 'Loading init segment...');
                 updateProgress(35, 'Loading init');
@@ -424,34 +513,46 @@
                 await appendToSourceBuffer(initDecrypted);
                 log('success', '✓ Init segment appended');
 
-                // Load and decrypt media segments
+                // BUFFER STRATEGY: Load initial buffer like YouTube
                 const totalSegments = manifest.segments.length;
+                const initialBufferSegments = 30; // ~30 seconds initial buffer
 
-                for (let i = 0; i < totalSegments; i++) {
-                    const segment = manifest.segments[i];
-                    const progress = 35 + (i / totalSegments) * 60;
+                log('info', `🎬 YouTube-style buffering: loading ${initialBufferSegments} segments initially`);
 
-                    updateProgress(progress, `Segment ${i + 1}/${totalSegments}`);
-                    log('info', `Loading segment ${i}...`);
+                // Load initial buffer
+                await loadSegmentRange(0, Math.min(initialBufferSegments, totalSegments));
 
-                    const encrypted = await fetchRange(manifest.blob_file, segment.offset, segment.size);
-                    const decrypted = await decryptSegment(encrypted, aesKey);
-
-                    await appendToSourceBuffer(decrypted);
-
-                    log('success', `✓ Segment ${i} appended (${(decrypted.byteLength / 1024).toFixed(1)} KB)`);
-                }
-
-                // End stream
-                if (mediaSource.readyState === 'open') {
-                    mediaSource.endOfStream();
-                    log('success', '✓ Stream ended - ready to play!');
-                }
-
-                updateProgress(100, 'Ready!');
+                // Enable playback
+                log('success', `✓ Initial buffer loaded (${loadedSegments.size} segments) - ready to play!`);
+                updateProgress(65, 'Ready to play!');
                 video.style.display = 'block';
                 playBtn.style.display = 'inline-block';
                 playBtn.disabled = false;
+
+                // Setup buffer monitoring
+                video.addEventListener('timeupdate', checkBuffer);
+                video.addEventListener('seeking', async () => {
+                    const seekTime = video.currentTime;
+                    const seekSegmentIdx = getSegmentIndexForTime(seekTime);
+                    const bufferAhead = 30;
+
+                    log('info', `⏩ Seeking to ${seekTime.toFixed(1)}s (segment ${seekSegmentIdx})`);
+
+                    // Don't try to load beyond file end
+                    if (seekSegmentIdx >= totalSegments) {
+                        log('info', '⏹️ Seek at end of file');
+                        return;
+                    }
+
+                    // Load segments around seek position if not loaded
+                    const startIdx = Math.max(0, seekSegmentIdx - 5);
+                    const endIdx = Math.min(seekSegmentIdx + bufferAhead, totalSegments);
+
+                    if (!loadedSegments.has(seekSegmentIdx)) {
+                        log('info', `📦 Loading segments ${startIdx}-${endIdx} for seek`);
+                        await loadSegmentRange(startIdx, endIdx);
+                    }
+                });
 
             } catch (err) {
                 log('error', `✗ Failed: ${err.message}`);
