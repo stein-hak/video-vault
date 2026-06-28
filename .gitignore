@@ -1,0 +1,48 @@
+# Output directories
+output*/
+recordings/
+test*/
+keys/
+
+# Generated keys (NEVER commit private keys!)
+*.pem
+public_key.pem
+private_key.pem
+
+# Encrypted blobs
+*.blob
+segments.blob
+
+# Manifests (may contain sensitive metadata)
+manifest.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+*.log
+
+# Temporary files
+temp*.mp4
+*.tmp

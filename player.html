@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Encrypted Video Player - Production</title>
+    <style>
+        body {
+            font-family: monospace;
+            background: #1a1a1a;
+            color: #fff;
+            padding: 20px;
+            max-width: 900px;
+            margin: 0 auto;
+        }
+        video {
+            width: 100%;
+            max-width: 800px;
+            background: #000;
+            display: block;
+            margin: 20px 0;
+        }
+        button {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            margin: 5px;
+            cursor: pointer;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        button:hover { background: #0056b3; }
+        button:disabled {
+            background: #555;
+            cursor: not-allowed;
+        }
+        #privateKeySection {
+            background: #2a2a2a;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+            border: 2px solid #444;
+        }
+        #privateKeySection h3 {
+            margin-top: 0;
+            color: #ffa500;
+        }
+        #privateKeyInput {
+            width: 100%;
+            height: 200px;
+            background: #1a1a1a;
+            color: #0f0;
+            border: 1px solid #555;
+            padding: 10px;
+            font-family: 'Courier New', monospace;
+            font-size: 11px;
+            border-radius: 4px;
+            resize: vertical;
+        }
+        #log {
+            background: #2a2a2a;
+            padding: 15px;
+            border-radius: 8px;
+            max-height: 400px;
+            overflow-y: auto;
+            font-size: 11px;
+            margin-top: 20px;
+        }
+        .log-entry { margin: 3px 0; }
+        .success { color: #0f0; }
+        .error { color: #f00; }
+        .info { color: #aaa; }
+        .warning { color: #ff0; }
+        .progress-bar {
+            width: 100%;
+            height: 20px;
+            background: #444;
+            border-radius: 4px;
+            overflow: hidden;
+            margin: 10px 0;
+        }
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #007bff, #0056b3);
+            width: 0%;
+            transition: width 0.3s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 12px;
+        }
+        .encryption-info {
+            background: #2a2a2a;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+            font-size: 12px;
+        }
+        .encryption-info span {
+            color: #0f0;
+        }
+    </style>
+</head>
+<body>
+    <h1>🔐 Encrypted Video Player</h1>
+    <p style="color: #888;">Streaming fMP4 → RSA/AES-256-GCM decryption → MSE playback</p>
+
+    <div id="encryptionInfo" class="encryption-info" style="display:none;">
+        <strong>Encryption:</strong> <span id="encryptionMethod"></span>
+    </div>
+
+    <div id="privateKeySection" style="display:none;">
+        <h3>🔒 Private Key Required</h3>
+        <p style="color: #aaa; font-size: 12px;">This video is protected with RSA encryption. Paste your private key below to decrypt:</p>
+        <textarea id="privateKeyInput" placeholder="Paste RSA private key (PEM format) here...&#10;&#10;-----BEGIN PRIVATE KEY-----&#10;...&#10;-----END PRIVATE KEY-----"></textarea>
+        <button id="unlockBtn">Unlock & Load Video</button>
+    </div>
+
+    <video id="video" controls style="display:none;"></video>
+
+    <div id="controls">
+        <button id="loadBtn">Load Encrypted Video</button>
+        <button id="playBtn" disabled style="display:none;">Play</button>
+    </div>
+
+    <div class="progress-bar">
+        <div class="progress-fill" id="progressFill">0%</div>
+    </div>
+
+    <div id="log"></div>
+
+    <script>
+        const video = document.getElementById('video');
+        const loadBtn = document.getElementById('loadBtn');
+        const playBtn = document.getElementById('playBtn');
+        const unlockBtn = document.getElementById('unlockBtn');
+        const privateKeySection = document.getElementById('privateKeySection');
+        const privateKeyInput = document.getElementById('privateKeyInput');
+        const progressFill = document.getElementById('progressFill');
+        const logEl = document.getElementById('log');
+        const encryptionInfo = document.getElementById('encryptionInfo');
+        const encryptionMethod = document.getElementById('encryptionMethod');
+
+        let manifest = null;
+        let aesKey = null;
+        let mediaSource = null;
+        let sourceBuffer = null;
+
+        function log(level, message) {
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${level}`;
+            const time = new Date().toLocaleTimeString();
+            entry.textContent = `[${time}] ${message}`;
+            logEl.appendChild(entry);
+            logEl.scrollTop = logEl.scrollHeight;
+            console.log(message);
+        }
+
+        function updateProgress(percent, text) {
+            progressFill.style.width = `${percent}%`;
+            progressFill.textContent = text || `${percent.toFixed(0)}%`;
+        }
+
+        async function hexToBytes(hex) {
+            const bytes = new Uint8Array(hex.length / 2);
+            for (let i = 0; i < hex.length; i += 2) {
+                bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
+            }
+            return bytes;
+        }
+
+        async function importAESKey(keyBytes) {
+            return await crypto.subtle.importKey(
+                'raw',
+                keyBytes,
+                { name: 'AES-GCM' },
+                false,
+                ['decrypt']
+            );
+        }
+
+        async function importPrivateKeyPEM(pemKey) {
+            // Remove header, footer, and whitespace
+            const pemHeader = "-----BEGIN PRIVATE KEY-----";
+            const pemFooter = "-----END PRIVATE KEY-----";
+
+            let pemContents = pemKey.trim();
+            if (pemContents.includes(pemHeader)) {
+                pemContents = pemContents.substring(
+                    pemContents.indexOf(pemHeader) + pemHeader.length,
+                    pemContents.indexOf(pemFooter)
+                );
+            }
+            pemContents = pemContents.replace(/\s/g, '');
+
+            // Base64 decode
+            const binaryDer = atob(pemContents);
+            const binaryArray = new Uint8Array(binaryDer.length);
+            for (let i = 0; i < binaryDer.length; i++) {
+                binaryArray[i] = binaryDer.charCodeAt(i);
+            }
+
+            // Import as PKCS8 private key
+            return await crypto.subtle.importKey(
+                'pkcs8',
+                binaryArray,
+                {
+                    name: 'RSA-OAEP',
+                    hash: 'SHA-256'
+                },
+                false,
+                ['decrypt']
+            );
+        }
+
+        async function decryptAESKey(encryptedKeyHex, privateKey) {
+            const encryptedBytes = await hexToBytes(encryptedKeyHex);
+
+            const decryptedKey = await crypto.subtle.decrypt(
+                { name: 'RSA-OAEP' },
+                privateKey,
+                encryptedBytes
+            );
+
+            return new Uint8Array(decryptedKey);
+        }
+
+        async function decryptSegment(encrypted, aesKey) {
+            const iv = encrypted.slice(0, 12);
+            const tag = encrypted.slice(-16);
+            const ciphertext = encrypted.slice(12, -16);
+
+            const ciphertextWithTag = new Uint8Array(ciphertext.byteLength + tag.byteLength);
+            ciphertextWithTag.set(new Uint8Array(ciphertext), 0);
+            ciphertextWithTag.set(new Uint8Array(tag), ciphertext.byteLength);
+
+            try {
+                const decrypted = await crypto.subtle.decrypt(
+                    { name: 'AES-GCM', iv: iv, tagLength: 128 },
+                    aesKey,
+                    ciphertextWithTag
+                );
+                return decrypted;
+            } catch (err) {
+                throw new Error(`Decryption failed: ${err.message}`);
+            }
+        }
+
+        async function fetchRange(url, offset, size) {
+            const rangeHeader = `bytes=${offset}-${offset + size - 1}`;
+            const response = await fetch(url, {
+                headers: { 'Range': rangeHeader }
+            });
+
+            if (!response.ok && response.status !== 206) {
+                throw new Error(`Range request failed: ${response.status}`);
+            }
+
+            return await response.arrayBuffer();
+        }
+
+        async function appendToSourceBuffer(data) {
+            return new Promise((resolve, reject) => {
+                if (sourceBuffer.updating) {
+                    setTimeout(() => appendToSourceBuffer(data).then(resolve).catch(reject), 10);
+                    return;
+                }
+
+                const onUpdate = () => {
+                    sourceBuffer.removeEventListener('updateend', onUpdate);
+                    sourceBuffer.removeEventListener('error', onError);
+                    resolve();
+                };
+
+                const onError = (e) => {
+                    sourceBuffer.removeEventListener('updateend', onUpdate);
+                    sourceBuffer.removeEventListener('error', onError);
+                    reject(new Error(`SourceBuffer error: ${e.type}`));
+                };
+
+                sourceBuffer.addEventListener('updateend', onUpdate);
+                sourceBuffer.addEventListener('error', onError);
+
+                try {
+                    sourceBuffer.appendBuffer(data);
+                } catch (err) {
+                    sourceBuffer.removeEventListener('updateend', onUpdate);
+                    sourceBuffer.removeEventListener('error', onError);
+                    reject(err);
+                }
+            });
+        }
+
+        loadBtn.addEventListener('click', async () => {
+            loadBtn.disabled = true;
+            updateProgress(0, 'Starting...');
+
+            try {
+                // Step 1: Load manifest
+                log('info', 'Loading manifest...');
+                updateProgress(5, 'Loading manifest');
+                const manifestRes = await fetch('manifest.json');
+                manifest = await manifestRes.json();
+
+                const encInfo = manifest.encryption;
+                log('success', `✓ Manifest loaded: ${manifest.segment_count} segments, ${manifest.total_duration.toFixed(1)}s`);
+
+                // Show encryption info
+                encryptionInfo.style.display = 'block';
+                encryptionMethod.textContent = `${encInfo.method}${encInfo.key_encryption ? ' + ' + encInfo.key_encryption : ''}`;
+
+                // Check if RSA encrypted
+                if (encInfo.key_encryption === 'RSA-OAEP-SHA256') {
+                    log('warning', '⚠️  Video protected with RSA - private key required');
+                    privateKeySection.style.display = 'block';
+                    updateProgress(10, 'Waiting for key...');
+                    loadBtn.disabled = false;
+                    return;
+                }
+
+                // Plaintext key - proceed directly
+                log('info', 'Using plaintext AES key...');
+                const keyBytes = await hexToBytes(encInfo.key_hex);
+                aesKey = await importAESKey(keyBytes);
+                log('success', '✓ AES key imported');
+
+                await loadAndPlayVideo();
+
+            } catch (err) {
+                log('error', `✗ Failed: ${err.message}`);
+                console.error(err);
+                loadBtn.disabled = false;
+                updateProgress(0, 'Failed');
+            }
+        });
+
+        unlockBtn.addEventListener('click', async () => {
+            unlockBtn.disabled = true;
+
+            try {
+                const privateKeyPEM = privateKeyInput.value.trim();
+
+                if (!privateKeyPEM) {
+                    throw new Error('Please paste your private key');
+                }
+
+                log('info', 'Importing RSA private key...');
+                updateProgress(15, 'Importing RSA key');
+
+                const privateKey = await importPrivateKeyPEM(privateKeyPEM);
+                log('success', '✓ RSA private key imported');
+
+                // Decrypt AES key
+                log('info', 'Decrypting AES key with RSA...');
+                updateProgress(20, 'Decrypting AES key');
+
+                const encryptedKeyHex = manifest.encryption.encrypted_key_hex;
+                const aesKeyBytes = await decryptAESKey(encryptedKeyHex, privateKey);
+
+                log('success', `✓ AES key decrypted (${aesKeyBytes.length} bytes)`);
+
+                // Import AES key
+                aesKey = await importAESKey(aesKeyBytes);
+                log('success', '✓ AES key ready for decryption');
+
+                // Hide private key section
+                privateKeySection.style.display = 'none';
+
+                await loadAndPlayVideo();
+
+            } catch (err) {
+                log('error', `✗ Unlock failed: ${err.message}`);
+                console.error(err);
+                unlockBtn.disabled = false;
+                updateProgress(0, 'Unlock failed');
+            }
+        });
+
+        async function loadAndPlayVideo() {
+            try {
+                // Check codec support
+                const videoCodec = manifest.video.codec;
+                const audioCodec = manifest.audio.codec;
+                const codecString = `video/mp4; codecs="${videoCodec},${audioCodec}"`;
+
+                log('info', `Checking codec: ${codecString}`);
+                const supported = MediaSource.isTypeSupported(codecString);
+
+                if (!supported) {
+                    throw new Error(`Codec not supported: ${codecString}`);
+                }
+                log('success', `✓ Codec supported`);
+
+                // Setup MediaSource
+                log('info', 'Creating MediaSource...');
+                updateProgress(30, 'Creating MediaSource');
+
+                mediaSource = new MediaSource();
+                video.src = URL.createObjectURL(mediaSource);
+
+                await new Promise((resolve, reject) => {
+                    mediaSource.addEventListener('sourceopen', resolve, { once: true });
+                    mediaSource.addEventListener('error', reject, { once: true });
+                });
+
+                log('success', '✓ MediaSource opened');
+
+                sourceBuffer = mediaSource.addSourceBuffer(codecString);
+                log('success', '✓ SourceBuffer created');
+
+                // Load and decrypt init segment
+                log('info', 'Loading init segment...');
+                updateProgress(35, 'Loading init');
+
+                const initSegment = manifest.init_segment;
+                const initEncrypted = await fetchRange(manifest.blob_file, initSegment.offset, initSegment.size);
+
+                log('info', `Decrypting init segment (${initSegment.size} bytes)...`);
+                const initDecrypted = await decryptSegment(initEncrypted, aesKey);
+
+                log('success', `✓ Init decrypted: ${initDecrypted.byteLength} bytes`);
+
+                log('info', 'Appending init segment to SourceBuffer...');
+                await appendToSourceBuffer(initDecrypted);
+                log('success', '✓ Init segment appended');
+
+                // Load and decrypt media segments
+                const totalSegments = manifest.segments.length;
+
+                for (let i = 0; i < totalSegments; i++) {
+                    const segment = manifest.segments[i];
+                    const progress = 35 + (i / totalSegments) * 60;
+
+                    updateProgress(progress, `Segment ${i + 1}/${totalSegments}`);
+                    log('info', `Loading segment ${i}...`);
+
+                    const encrypted = await fetchRange(manifest.blob_file, segment.offset, segment.size);
+                    const decrypted = await decryptSegment(encrypted, aesKey);
+
+                    await appendToSourceBuffer(decrypted);
+
+                    log('success', `✓ Segment ${i} appended (${(decrypted.byteLength / 1024).toFixed(1)} KB)`);
+                }
+
+                // End stream
+                if (mediaSource.readyState === 'open') {
+                    mediaSource.endOfStream();
+                    log('success', '✓ Stream ended - ready to play!');
+                }
+
+                updateProgress(100, 'Ready!');
+                video.style.display = 'block';
+                playBtn.style.display = 'inline-block';
+                playBtn.disabled = false;
+
+            } catch (err) {
+                log('error', `✗ Failed: ${err.message}`);
+                console.error(err);
+                updateProgress(0, 'Failed');
+                throw err;
+            }
+        }
+
+        playBtn.addEventListener('click', () => {
+            video.play();
+        });
+
+        video.addEventListener('loadedmetadata', () => {
+            log('success', `✓ Video metadata loaded: ${video.duration.toFixed(1)}s, ${video.videoWidth}x${video.videoHeight}`);
+        });
+
+        video.addEventListener('playing', () => {
+            log('success', '✓ Video playing!');
+        });
+
+        video.addEventListener('error', (e) => {
+            log('error', `✗ Video error: ${video.error ? video.error.message : 'unknown'}`);
+            console.error('Video error:', e, video.error);
+        });
+
+        log('info', 'Player ready. Click "Load Encrypted Video" to start.');
+    </script>
+</body>
+</html>
