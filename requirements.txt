@@ -1,0 +1,11 @@
+# Zero-knowledge encrypted video storage system
+# Python dependencies
+
+# Cryptography (AES-256-GCM, RSA-OAEP)
+cryptography>=41.0.0
+
+# MP4 box parsing
+pymp4>=1.4.0
+
+# GStreamer Python bindings
+PyGObject>=3.42.0
